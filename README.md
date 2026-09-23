@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/PYTHON-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
 [![Built by](https://img.shields.io/badge/BUILT%20BY-JGALEA-8A2BE2?style=for-the-badge&logo=github&logoColor=white)](https://github.com/jgalea)
 
-**Read your school's iSAMS parent portal from the terminal: timetable, school calendar, attendance, teachers, homework, reports, documents and forms.**
+**Read your school's iSAMS parent portal from the terminal: timetable, school calendar, after-school clubs, attendance, teachers, homework, reports, documents and forms.**
 
 </div>
 
@@ -25,7 +25,7 @@ isams login
 
 If `isams` isn't found afterwards, add `~/.local/bin` to your PATH: `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc` and open a new terminal.
 
-`login` asks for the school (the `SCHOOL` in `SCHOOL.parents.isams.cloud`) and your portal username and password. The password goes only to the school's iSAMS sign-in page. What's saved, at `~/.config/isams/session.json` (mode 600), is the refresh token, so you aren't asked again until the school ends the session.
+`login` asks for the school (the `SCHOOL` in `SCHOOL.parents.isams.cloud`) and your portal username and password. The password goes only to the school's iSAMS sign-in page. What's saved, in `~/.config/isams/` (mode 600), is the refresh token and the sign-in cookies, so you aren't asked again until the school ends the session.
 
 To sign in without prompts, set `ISAMS_SCHOOL` and point `ISAMS_OP_ITEM` at a 1Password item with `username` and `password` fields, e.g. `op://Private/iSAMS`.
 
@@ -35,6 +35,7 @@ To sign in without prompts, set `ISAMS_SCHOOL` and point `ISAMS_OP_ITEM` at a 1P
 isams whoami                      who's signed in, and the children
 isams timetable [child]           today's lessons (-d tomorrow|fri|YYYY-MM-DD, -w for the week)
 isams calendar                    school calendar, next 14 days (--days, --from, -s text)
+isams activities [child]          after-school clubs from SOCS: day, staff, next session (--sessions for every date)
 isams attendance [child]          this term's absences and lates
 isams teachers [child]            subjects, teachers and their emails
 isams homework [child]            homework (--status outstanding|submitted|completed)
@@ -50,3 +51,5 @@ isams raw <path>                  GET any API path, e.g. portals/schools/terms
 `child` matches part of a name or a form (`sam`, `3A`). Leave it out for all children. Every command takes `--json`.
 
 Which sections return data depends on what your school has switched on in the portal.
+
+`activities` works for schools that run clubs in SOCS and link it from the iSAMS parent portal. SOCS signs you in through the same iSAMS account, so there's no second login. The SOCS school number is read from the portal; set `ISAMS_SOCS_ID` if it can't be found. SOCS doesn't hold club descriptions, only names, staff and dates.

@@ -27,6 +27,7 @@ from datetime import date, datetime, timedelta
 CONFIG = os.path.abspath(
     os.path.expanduser(os.environ.get("ISAMS_HOME", "~/.config/isams")))
 SESSION = os.path.join(CONFIG, "session.json")
+COOKIES = os.path.join(CONFIG, "cookies.txt")
 OP_ITEM = os.environ.get("ISAMS_OP_ITEM")  # e.g. op://Private/iSAMS
 CLIENT_ID = "iSAMS.Portal.Cloud.Parents"
 SCOPE = "offline_access openid iSAMS.CloudPortals.Api"
@@ -117,6 +118,41 @@ def ask_school():
     return school_host(input("School (the SCHOOL part, or paste the address): "))
 
 
+def submit_login(browser, page, page_url):
+    """Fill in the iSAMS sign-in form on page and post it."""
+    def field(pattern):
+        m = re.search(pattern, page)
+        if not m:
+            sys.exit("The sign-in page has changed shape; this tool needs updating.")
+        return html.unescape(m.group(1))
+
+    action = field(r'<form id="login-form"[^>]*action="([^"]+)"')
+    username, password = credentials()
+    form = urllib.parse.urlencode({
+        "ReturnUrl": field(r'name="ReturnUrl" value="([^"]*)"'),
+        "DeviceFingerprint": secrets.token_hex(16),
+        "Username": username, "Password": password,
+        "__RequestVerificationToken": field(r'name="__RequestVerificationToken" type="hidden" value="([^"]+)"'),
+        "RememberUsername": "false"}).encode()
+    return browser.open(urllib.parse.urljoin(page_url, action), form, timeout=45)
+
+
+def cookie_jar():
+    jar = http.cookiejar.MozillaCookieJar(COOKIES)
+    try:
+        jar.load(ignore_discard=True)
+    except (OSError, http.cookiejar.LoadError):
+        pass
+    return jar
+
+
+def save_jar(jar):
+    """Keep the sign-in cookies so SOCS can reuse them instead of the password."""
+    os.makedirs(CONFIG, mode=0o700, exist_ok=True)
+    jar.save(ignore_discard=True)
+    os.chmod(COOKIES, 0o600)
+
+
 def pkce_login(school):
     """Walk the portal's sign-in: authorize, post the login form, swap the code."""
     auth = f"https://{school}.isams.cloud/auth"
@@ -136,35 +172,21 @@ def pkce_login(school):
                 raise _Callback(newurl)
             return super().redirect_request(req, fp, code, msg, hdrs, newurl)
 
-    jar = http.cookiejar.CookieJar()
+    jar = http.cookiejar.MozillaCookieJar(COOKIES)
     browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar),
                                           StopAtCallback())
     browser.addheaders = [("User-Agent", UA), ("Accept-Language", "en")]
     try:
-        page = browser.open(f"{auth}/connect/authorize?{query}", timeout=45).read().decode()
+        r = browser.open(f"{auth}/connect/authorize?{query}", timeout=45)
     except urllib.error.HTTPError as e:
         sys.exit(f"Could not reach {school}.isams.cloud (HTTP {e.code}). Check the school name.")
-
-    def field(pattern):
-        m = re.search(pattern, page)
-        if not m:
-            sys.exit("The sign-in page has changed shape; this tool needs updating.")
-        return html.unescape(m.group(1))
-
-    action = field(r'<form id="login-form"[^>]*action="([^"]+)"')
-    username, password = credentials()
-    form = urllib.parse.urlencode({
-        "ReturnUrl": field(r'name="ReturnUrl" value="([^"]*)"'),
-        "DeviceFingerprint": secrets.token_hex(16),
-        "Username": username, "Password": password,
-        "__RequestVerificationToken": field(r'name="__RequestVerificationToken" type="hidden" value="([^"]+)"'),
-        "RememberUsername": "false"}).encode()
     try:
-        browser.open(f"https://{school}.isams.cloud{action}", form, timeout=45).read()
+        submit_login(browser, r.read().decode(), r.url).read()
     except _Callback as cb:
         code = urllib.parse.parse_qs(urllib.parse.urlparse(cb.url).query).get("code")
         if not code:
             sys.exit("The portal did not hand back a sign-in code.")
+        save_jar(jar)
         return token_request(school, {"grant_type": "authorization_code", "code": code[0],
                                       "redirect_uri": redirect_uri, "code_verifier": verifier})
     sys.exit("Sign-in failed. Check the username and password, or whether the "
@@ -365,6 +387,163 @@ def current_term():
     return past[-1] if past else terms[-1]
 
 
+# ---- SOCS (after-school activities) ---------------------------------------
+# Many iSAMS schools run clubs in SOCS, which signs parents in through the same
+# iSAMS account. The cookies saved at login usually get us in without a password.
+
+SOCS = "https://www.socscms.com"
+
+
+def socs_school():
+    env = os.environ.get("ISAMS_SOCS_ID")
+    if env:
+        return env
+    sess = session()
+    if not sess.get("socs_id"):
+        req = urllib.request.Request(
+            f"https://{sess['school']}.parents.isams.cloud/api/layout?guest=false",
+            headers={"Authorization": f"Bearer {sess['access_token']}", "User-Agent": UA})
+        with OPENER.open(req, timeout=45) as r:
+            m = re.search(r"socscms\.com/(\d+)", r.read().decode("utf8", "replace"))
+        if not m:
+            sys.exit("This school's portal has no SOCS link, so there are no activities to show. "
+                     "If it does use SOCS, set ISAMS_SOCS_ID to its SOCS school number.")
+        sess["socs_id"] = m.group(1)
+        save(sess)
+    return sess["socs_id"]
+
+
+def socs_browser(jar):
+    browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    browser.addheaders = [("User-Agent", UA), ("Accept-Language", "en")]
+    return browser
+
+
+def socs_login(jar):
+    browser = socs_browser(jar)
+    r = browser.open(f"{SOCS}/login/{socs_school()}/parent", timeout=45)
+    page = r.read().decode("utf8", "replace")
+    if 'id="login-form"' in page:
+        r = submit_login(browser, page, r.url)
+        page = r.read().decode("utf8", "replace")
+    # The identity server answers with a self-submitting form back to SOCS.
+    for _ in range(3):
+        form = re.search(r"<form[^>]*action=['\"]([^'\"]+signin-oidc)['\"]", page)
+        if not form:
+            break
+        fields = re.findall(r"<input[^>]*name=['\"]([^'\"]+)['\"][^>]*value=['\"]([^'\"]*)['\"]", page)
+        body = urllib.parse.urlencode({k: html.unescape(v) for k, v in fields}).encode()
+        r = browser.open(html.unescape(form.group(1)), body, timeout=45)
+        page = r.read().decode("utf8", "replace")
+    if "/socs/parent/" not in r.url:
+        sys.exit("Could not sign in to SOCS. Try 'isams login' and run this again.")
+    save_jar(jar)
+    return page
+
+
+def socs_page(path):
+    jar = cookie_jar()
+    r = socs_browser(jar).open(f"{SOCS}/socs/parent/{path}", timeout=45)
+    page = r.read().decode("utf8", "replace")
+    if "/login/" in r.url or re.search(r"<title>\s*SOCS Login", page):
+        socs_login(jar)
+        page = socs_browser(jar).open(f"{SOCS}/socs/parent/{path}", timeout=45).read().decode("utf8", "replace")
+    return page
+
+
+def text(fragment):
+    return clean(re.sub(r"<[^>]+>", " ", fragment or ""))
+
+
+def unprefix(label):
+    """SOCS sorts with a leading number: '3 Lego Club Gr 2' -> 'Lego Club Gr 2'."""
+    return re.sub(r"^\s*\d+\s+", "", label).strip()
+
+
+def socs_pupils():
+    home = socs_page("Default.asp")
+    return [{"name": clean(name), "year": clean(year), "id": pid}
+            for name, year, pid in re.findall(
+                r"<h2[^>]*>([^<(]+?)\s*\(([^)]*)\):</h2>.*?activities\.asp\?P=(\d+)", home, re.DOTALL)]
+
+
+def socs_sessions(club_id, pupil_id):
+    page = socs_page(f"ActivityClubEvents.asp?ActivityClubID={club_id}&P={pupil_id}")
+    rows = []
+    for tr in re.findall(r"<tr>(.*?)</tr>", page, re.DOTALL):
+        cells = [text(c) for c in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.DOTALL)]
+        if len(cells) >= 2:
+            try:
+                day = date(*time.strptime(cells[0], "%a %d %b %Y")[:3])
+            except ValueError:
+                continue
+            rows.append({"date": day.isoformat(), "time": cells[1],
+                         "place": cells[2] if len(cells) > 2 else ""})
+    return rows
+
+
+def socs_activities(pupil):
+    page = socs_page(f"activities.asp?ListT=1&P={pupil['id']}")
+    term = re.search(r"<h2>(.*?)<br\s*/?>\s*My Activities</h2>", page)
+    clubs = []
+    for day, body in re.findall(
+            r'class="collapsible-set-opener"[^>]*>(.*?)</a>(.*?)(?=class="collapsible-set-opener"|$)', page, re.DOTALL):
+        for td in re.findall(r"<td>(.*?)</td>", body, re.DOTALL):
+            club = re.search(r'<a name="(\d+)">', td)
+            name = re.search(r'class="ActivityName"[^>]*>(.*?)</p>', td, re.DOTALL)
+            if not club or not name:
+                continue
+            years = re.search(r"Year Groups: </span>([^<]*)", td)
+            notes = re.search(r'class="ActivityNotes"[^>]*>(.*?)</span>', td, re.DOTALL)
+            clubs.append({
+                "id": club.group(1), "day": unprefix(text(day)), "name": unprefix(text(name.group(1))),
+                "staff": [clean(x) for x in re.findall(r'<li><span title="([^"]*)"', td)],
+                "year_groups": clean(years.group(1)) if years else "",
+                "notes": text(notes.group(1)) if notes else "",
+                "sessions": socs_sessions(club.group(1), pupil["id"])})
+    return {"term": text(term.group(1)) if term else "", "clubs": clubs}
+
+
+def cmd_activities(args):
+    pupils = socs_pupils()
+    if args.child:
+        n = args.child.lower()
+        pupils = [p for p in pupils if n in p["name"].lower()]
+        if not pupils:
+            sys.exit(f"No child matches '{args.child}' in SOCS.")
+    data = {p["name"]: socs_activities(p) for p in pupils}
+    if args.json:
+        out(args, data, None)
+        return
+    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+
+    def done(x):
+        """A session is over once its end time today has passed."""
+        end = (re.findall(r"\d{1,2}:\d{2}", x["time"]) or ["23:59"])[-1].zfill(5)
+        return f"{x['date']} {end}" < now
+
+    for i, (name, d) in enumerate(data.items()):
+        print(("\n" if i else "") + f"== {name.split(' ')[0]}" + (f", {d['term']}" if d["term"] else "") + " ==")
+        if not d["clubs"]:
+            print("  No activities signed up.")
+        for c in d["clubs"]:
+            s = c["sessions"]
+            ahead = [x for x in s if not done(x)]
+            print(f"  {c['day']:<10} {c['name']}  ({', '.join(c['staff']) or 'staff not listed'})")
+            if s:
+                when = f"{s[0]['time']}, {s[0]['place']}".rstrip(", ")
+                nxt = (f"next {date.fromisoformat(ahead[0]['date']):%a %d %b}, "
+                       if ahead else "finished, ")
+                print(f"  {'':<10} {when}; {nxt}{len(ahead)} of {len(s)} sessions left, "
+                      f"last {date.fromisoformat(s[-1]['date']):%d %b}")
+            if c["notes"]:
+                print(f"  {'':<10} {c['notes']}")
+            if args.sessions:
+                for x in s:
+                    mark = "✓ " if done(x) else "  "
+                    print(f"  {'':<12}{mark}{date.fromisoformat(x['date']):%a %d %b}  {x['time']}")
+
+
 # ---- commands --------------------------------------------------------------
 
 def cmd_login(args):
@@ -373,8 +552,9 @@ def cmd_login(args):
 
 
 def cmd_logout(args):
-    if os.path.exists(SESSION):
-        os.remove(SESSION)
+    for path in (SESSION, COOKIES):
+        if os.path.exists(path):
+            os.remove(path)
     print("Signed out; the saved session is deleted.")
 
 
@@ -712,6 +892,10 @@ def main():
     s.add_argument("id", help="document id, from 'isams docs'")
     s.add_argument("--dir", default=".", help="where to save it (default here)")
     s.set_defaults(fn=cmd_download)
+
+    s = sub.add_parser("activities", help="after-school clubs, from SOCS", parents=[common, kid])
+    s.add_argument("--sessions", action="store_true", help="list every session date")
+    s.set_defaults(fn=cmd_activities)
 
     sub.add_parser("invoices", help="invoices on the portal", parents=[common]).set_defaults(fn=cmd_invoices)
     sub.add_parser("forms", help="electronic forms to fill in", parents=[common]).set_defaults(fn=cmd_forms)

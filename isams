@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""iSAMS parent portal CLI.
+
+Signs in the way the parent portal does (OpenID Connect with PKCE) and then
+calls the same JSON API the portal's web app uses. The password only goes to
+your school's iSAMS sign-in page; what gets saved is the refresh token, so you
+are not asked again until the school ends the session."""
+
+import argparse
+import base64
+import getpass
+import hashlib
+import html
+import http.cookiejar
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timedelta
+
+CONFIG = os.path.abspath(
+    os.path.expanduser(os.environ.get("ISAMS_HOME", "~/.config/isams")))
+SESSION = os.path.join(CONFIG, "session.json")
+OP_ITEM = os.environ.get("ISAMS_OP_ITEM")  # e.g. op://Private/iSAMS
+CLIENT_ID = "iSAMS.Portal.Cloud.Parents"
+SCOPE = "offline_access openid iSAMS.CloudPortals.Api"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def today():
+    return datetime.now().astimezone().date()
+
+
+class ApiError(Exception):
+    def __init__(self, status, body):
+        super().__init__(f"HTTP {status}: {body[:200]}")
+        self.status = status
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib copies request headers to the redirect target, token included."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_private(path, text):
+    """Write via a fresh temp file so the result is always a 0600 inode."""
+    folder = os.path.dirname(path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def op_read(field):
+    r = subprocess.run(["op", "read", f"{OP_ITEM}/{field}"],
+                       capture_output=True, text=True, check=False)
+    if r.returncode:
+        sys.exit(f"1Password read failed for {field}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def credentials():
+    if OP_ITEM:
+        return op_read("username"), op_read("password")
+    if not sys.stdin.isatty():
+        sys.exit("Not a terminal, so I cannot ask for your password. "
+                 "Run 'isams login' in a terminal first.")
+    print("Sign in with the username and password you use on the parent portal.")
+    return input("Username or email: ").strip(), getpass.getpass("Password: ")
+
+
+def school_host(value):
+    """Accept 'myschool', 'myschool.isams.cloud' or a pasted portal URL."""
+    value = value.strip().lower()
+    value = re.sub(r"^https?://", "", value).split("/")[0]
+    value = value.replace(".parents.isams.cloud", "").replace(".isams.cloud", "")
+    if not re.fullmatch(r"[a-z0-9-]+", value):
+        sys.exit(f"'{value}' does not look like an iSAMS school name.")
+    return value
+
+
+def ask_school():
+    env = os.environ.get("ISAMS_SCHOOL")
+    if env:
+        return school_host(env)
+    if not sys.stdin.isatty():
+        sys.exit("Set ISAMS_SCHOOL or run 'isams login' in a terminal first.")
+    print("Your portal address looks like https://SCHOOL.parents.isams.cloud")
+    return school_host(input("School (the SCHOOL part, or paste the address): "))
+
+
+def pkce_login(school):
+    """Walk the portal's sign-in: authorize, post the login form, swap the code."""
+    auth = f"https://{school}.isams.cloud/auth"
+    redirect_uri = f"https://{school}.parents.isams.cloud/callback"
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    query = urllib.parse.urlencode({
+        "client_id": CLIENT_ID, "redirect_uri": redirect_uri,
+        "response_type": "code", "scope": SCOPE, "state": secrets.token_hex(16),
+        "code_challenge": challenge, "code_challenge_method": "S256",
+        "response_mode": "query", "acr_values": "portalType:Parents"})
+
+    class StopAtCallback(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+            if newurl.startswith(redirect_uri):
+                raise _Callback(newurl)
+            return super().redirect_request(req, fp, code, msg, hdrs, newurl)
+
+    jar = http.cookiejar.CookieJar()
+    browser = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar),
+                                          StopAtCallback())
+    browser.addheaders = [("User-Agent", UA), ("Accept-Language", "en")]
+    try:
+        page = browser.open(f"{auth}/connect/authorize?{query}", timeout=45).read().decode()
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Could not reach {school}.isams.cloud (HTTP {e.code}). Check the school name.")
+
+    def field(pattern):
+        m = re.search(pattern, page)
+        if not m:
+            sys.exit("The sign-in page has changed shape; this tool needs updating.")
+        return html.unescape(m.group(1))
+
+    action = field(r'<form id="login-form"[^>]*action="([^"]+)"')
+    username, password = credentials()
+    form = urllib.parse.urlencode({
+        "ReturnUrl": field(r'name="ReturnUrl" value="([^"]*)"'),
+        "DeviceFingerprint": secrets.token_hex(16),
+        "Username": username, "Password": password,
+        "__RequestVerificationToken": field(r'name="__RequestVerificationToken" type="hidden" value="([^"]+)"'),
+        "RememberUsername": "false"}).encode()
+    try:
+        browser.open(f"https://{school}.isams.cloud{action}", form, timeout=45).read()
+    except _Callback as cb:
+        code = urllib.parse.parse_qs(urllib.parse.urlparse(cb.url).query).get("code")
+        if not code:
+            sys.exit("The portal did not hand back a sign-in code.")
+        return token_request(school, {"grant_type": "authorization_code", "code": code[0],
+                                      "redirect_uri": redirect_uri, "code_verifier": verifier})
+    sys.exit("Sign-in failed. Check the username and password, or whether the "
+             "portal is asking for something extra (a password reset, a second factor).")
+
+
+class _Callback(Exception):
+    def __init__(self, url):
+        super().__init__(url)
+        self.url = url
+
+
+def token_request(school, fields):
+    fields = {**fields, "client_id": CLIENT_ID}
+    req = urllib.request.Request(f"https://{school}.isams.cloud/auth/connect/token",
+                                 urllib.parse.urlencode(fields).encode(),
+                                 headers={"User-Agent": UA})
+    try:
+        with OPENER.open(req, timeout=45) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        raise ApiError(e.code, e.read().decode())
+
+
+_SESSION = None
+
+
+def save(sess):
+    global _SESSION
+    _SESSION = sess
+    write_private(SESSION, json.dumps(sess))
+    return sess
+
+
+def store_tokens(school, tokens, extra=None):
+    return save({**(extra or {}), "school": school,
+                 "access_token": tokens["access_token"],
+                 "refresh_token": tokens.get("refresh_token"),
+                 "expires_at": int(time.time()) + int(tokens.get("expires_in", 3600)) - 60})
+
+
+def sign_in(school=None):
+    school = school or (read_json(SESSION) or {}).get("school") or ask_school()
+    sess = store_tokens(school, pkce_login(school))
+    profile = api("portals/account/profile")
+    sess["name"] = f"{profile.get('forename', '')} {profile.get('surname', '')}".strip()
+    sess["email"] = profile.get("email")
+    return save(sess)
+
+
+def session():
+    """A session with a live access token, refreshing or signing in as needed."""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = read_json(SESSION)
+        if not _SESSION or not _SESSION.get("school"):
+            return sign_in()
+    if time.time() < _SESSION.get("expires_at", 0):
+        return _SESSION
+    if _SESSION.get("refresh_token"):
+        try:
+            # Refresh tokens rotate: the old one is dead as soon as this returns.
+            tokens = token_request(_SESSION["school"], {"grant_type": "refresh_token",
+                                                        "refresh_token": _SESSION["refresh_token"]})
+            return store_tokens(_SESSION["school"], tokens,
+                                {k: _SESSION.get(k) for k in ("name", "email")})
+        except ApiError:
+            pass
+    return sign_in(_SESSION["school"])
+
+
+def request(url, token, raw=False):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}",
+                                               "Accept": "application/json",
+                                               "User-Agent": UA})
+    last = None
+    for attempt in range(3):
+        try:
+            with OPENER.open(req, timeout=45) as r:
+                body = r.read()
+                if raw:
+                    return body, r.headers
+                return json.loads(body) if body else {}
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, e.read().decode("utf8", "replace"))
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise SystemExit(f"Network error talking to iSAMS: {last}")
+
+
+def api(path, raw=False):
+    sess = session()
+    path = urllib.parse.quote(path.lstrip("/"), safe="/?=&$',:%@+")
+    url = f"https://{sess['school']}.isams.cloud/api/{path}"
+    try:
+        return request(url, sess["access_token"], raw)
+    except ApiError as e:
+        if e.status != 401:
+            raise
+        sess["expires_at"] = 0
+        return request(url, session()["access_token"], raw)
+
+
+def out(args, data, render):
+    if args.json:
+        json.dump(data, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+    else:
+        render(data)
+
+
+def clean(text):
+    """Strip HTML and control characters from server text before printing it."""
+    text = html.unescape(re.sub(r"<[^>]+>", " ", str(text or "")))
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f\x1b]", "", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def day_of(value):
+    """'2026-09-21T00:00:00+01:00' -> date, ignoring the placeholder years."""
+    if not value or value.startswith(("0001", "1900")):
+        return None
+    return date.fromisoformat(value[:10])
+
+
+def hhmm(value):
+    if not value or value.startswith("0001"):
+        return ""
+    return value[11:16]
+
+
+def parse_date(text):
+    text = text.lower()
+    now = today()
+    if text == "today":
+        return now
+    if text == "tomorrow":
+        return now + timedelta(days=1)
+    if text[:3] in DAYS:
+        return now + timedelta(days=(DAYS.index(text[:3]) - now.weekday()) % 7)
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        sys.exit(f"Not a date: {text} (use YYYY-MM-DD, today, tomorrow or a weekday)")
+
+
+# ---- children --------------------------------------------------------------
+
+_KIDS = None
+
+
+def kids():
+    global _KIDS
+    if _KIDS is None:
+        _KIDS = api("portals/students/portal/parents/3").get("students", [])
+    return _KIDS
+
+
+def first_name(kid):
+    return clean(kid.get("preferredName") or kid.get("forename") or "").split(" ")[0]
+
+
+def pick(name):
+    """All children, or the one whose name or form matches."""
+    everyone = kids()
+    if not name:
+        return everyone
+    n = name.lower()
+    hits = [k for k in everyone if n in (k.get("fullName") or "").lower()
+            or n == (k.get("formGroup") or "").lower()
+            or n == str(k.get("schoolId"))]
+    if not hits:
+        sys.exit(f"No child matches '{name}'. Try: " + ", ".join(first_name(k) for k in everyone))
+    return hits
+
+
+def per_kid(args, fetch, render):
+    """Fetch once per selected child and print a heading above each."""
+    chosen = pick(args.child)
+    results = [(k, fetch(k)) for k in chosen]
+    if args.json:
+        out(args, {first_name(k): d for k, d in results}, None)
+        return
+    for i, (k, d) in enumerate(results):
+        if len(chosen) > 1:
+            print(("\n" if i else "") + f"== {first_name(k)} ({k.get('formGroup')}) ==")
+        render(k, d)
+
+
+def current_term():
+    terms = api("portals/schools/terms").get("terms", [])
+    now = today().isoformat()
+    current = [t for t in terms if t["startDate"] <= now <= t["finishDate"]]
+    if current:
+        return current[0]
+    past = sorted((t for t in terms if t["startDate"] <= now), key=lambda t: t["startDate"])
+    return past[-1] if past else terms[-1]
+
+
+# ---- commands --------------------------------------------------------------
+
+def cmd_login(args):
+    sess = sign_in(school_host(args.school) if args.school else None)
+    print(f"Signed in to {sess['school']} as {sess.get('name') or sess.get('email')}.")
+
+
+def cmd_logout(args):
+    if os.path.exists(SESSION):
+        os.remove(SESSION)
+    print("Signed out; the saved session is deleted.")
+
+
+def cmd_whoami(args):
+    sess = session()
+    info = {"school": sess["school"], "name": sess.get("name"), "email": sess.get("email"),
+            "children": [f"{k.get('fullName')} ({k.get('formGroup')})" for k in kids()]}
+
+    def render(d):
+        print(f"{d['name']} <{d['email']}> at {d['school']}.isams.cloud")
+        for c in d["children"]:
+            print(f"  {clean(c)}")
+    out(args, info, render)
+
+
+def cmd_kids(args):
+    def render(data):
+        for k in data:
+            print(f"{clean(k.get('fullName'))}  form {k.get('formGroup')}  "
+                  f"{clean(k.get('yearGroup') and 'year ' + str(k.get('yearGroup')))}  "
+                  f"house {clean(k.get('academicHouse'))}  id {k.get('schoolId')}")
+    out(args, kids(), render)
+
+
+def timetable_for(kid):
+    sid = kid["schoolId"]
+    lessons = api(f"portals/students/{sid}/timetables/periods").get("timetablePeriods", [])
+    slots = api(f"portals/students/{sid}/timetables/weeks").get("timetableWeeks", [])
+    wanted = {l["period"] for l in lessons}
+    slots = [s for s in slots if s["periodId"] in wanted]
+    active = {s["currentActiveWeekId"] for s in slots}
+    by_period = {s["periodId"]: s for s in slots}
+    merged = {}
+    for l in lessons:
+        slot = by_period.get(l["period"])
+        if not slot:
+            continue
+        key = (l["period"], l.get("subject"))
+        row = merged.setdefault(key, {
+            "week": slot["weekName"], "week_id": slot["weekId"],
+            "current_week": slot["weekId"] in active,
+            "day": slot["dayName"], "day_order": slot["dayOrder"],
+            "start": hhmm(slot["periodStartTime"]), "end": hhmm(slot["periodEndTime"]),
+            "period": clean(slot["perdiodName"]), "subject": clean(l.get("subject")),
+            "room": clean(l.get("className")), "teachers": []})
+        teacher = clean(l.get("staffFullname"))
+        if teacher and teacher not in row["teachers"]:
+            row["teachers"].append(teacher)
+    return sorted(merged.values(), key=lambda r: (r["week_id"], r["day_order"], r["start"]))
+
+
+def cmd_timetable(args):
+    target = parse_date(args.day) if args.day else None
+    if args.week:
+        target = None
+    elif not args.day:
+        target = today()
+    wanted_day = target.strftime("%A") if target else None
+
+    def fetch(kid):
+        rows = timetable_for(kid)
+        if len({r["week_id"] for r in rows}) > 1 and not args.all_weeks:
+            rows = [r for r in rows if r["current_week"]]
+        if wanted_day:
+            rows = [r for r in rows if r["day"] == wanted_day]
+        return rows
+
+    def render(kid, rows):
+        if not rows:
+            print(f"No lessons on {wanted_day}." if wanted_day else "No timetable on file.")
+            return
+        day = None
+        for r in rows:
+            if r["day"] != day:
+                day = r["day"]
+                label = f"{day} {target.isoformat()}" if target else day
+                print(f"{label}" + (f"  [{r['week']}]" if args.all_weeks else ""))
+            print(f"  {r['start']}-{r['end']}  {r['subject'][:30]:<30} {r['room'][:18]:<18} "
+                  f"{', '.join(r['teachers'])}")
+    per_kid(args, fetch, render)
+
+
+def cmd_calendar(args):
+    start = parse_date(args.start) if args.start else today()
+    end = start + timedelta(days=args.days)
+    data = api(f"portals/calendar/events?targetId=2&startDate={start}&endDate={end}")
+    # The server ignores endDate and returns the rest of the year.
+    data = [e for e in data if (d := day_of(e.get("startDate"))) and start <= d < end]
+    if args.search:
+        s = args.search.lower()
+        data = [e for e in data if s in (e.get("description") or "").lower()
+                or s in (e.get("category") or "").lower()]
+    data.sort(key=lambda e: (e.get("startDate") or "", e.get("startTime") or ""))
+
+    def render(events):
+        if not events:
+            print(f"Nothing on the school calendar from {start} to {end}.")
+            return
+        day = None
+        for e in events:
+            d = day_of(e.get("startDate"))
+            if d != day:
+                day = d
+                print(f"{d:%a %d %b}")
+            when = "all day" if e.get("allDayEvent") else \
+                f"{hhmm(e.get('startTime'))}-{hhmm(e.get('endTime'))}".rstrip("-")
+            until = day_of(e.get("endDate"))
+            if until and until != d:
+                when += f" until {until:%a %d %b}"
+            place = f" @ {clean(e['location'])}" if clean(e.get("location")) else ""
+            print(f"  {when:<13} {clean(e.get('description'))}{place}  "
+                  f"[{clean(e.get('category'))}]")
+    out(args, data, render)
+
+
+def cmd_attendance(args):
+    term = current_term()
+
+    def fetch(kid):
+        return api(f"portals/students/{kid['schoolId']}/terms/{term['id']}"
+                   f"/attendancerecords/registration").get("attendanceRecords", [])
+
+    def render(kid, rows):
+        marks = [r for r in rows if r.get("code")]
+        late = [r for r in rows if r.get("late")]
+        print(f"{term['name']} {term['schoolYear']}: {len(rows)} registrations, "
+              f"{len(marks)} marked, {len(late)} late")
+        for r in marks + [r for r in late if r not in marks]:
+            when = (r.get("registrationDateTime") or "")[:10]
+            status = clean(r.get("registrationStatus"))
+            extra = f", {r['minutesLate']} min late" if r.get("late") else ""
+            print(f"  {when} {r.get('ampm', '')}  {status} ({r.get('code') or '-'}): "
+                  f"{clean(r.get('reason'))}{extra}  by {clean(r.get('registeredBy'))}")
+    per_kid(args, fetch, render)
+
+
+def cmd_teachers(args):
+    def fetch(kid):
+        sid = kid["schoolId"]
+        # Teaching groups carry no email addresses; the timetable does.
+        emails = {clean(l.get("staffSurname")).lower(): l.get("staffEmailAddress")
+                  for l in api(f"portals/students/{sid}/timetables/periods").get("timetablePeriods", [])
+                  if l.get("staffEmailAddress")}
+        rows = []
+        for g in api(f"portals/students/{sid}/teachinggroups").get("teachingGroups", []):
+            staff = [g.get("teacher") or {}] + list(g.get("associatedTeachers") or [])
+            rows.append({"subject": clean(g.get("subjectName")),
+                         "teachers": [{"name": clean(f"{t.get('title') or ''} {t.get('firstname') or ''} {t.get('surname') or ''}"),
+                                       "email": t.get("schoolEmailAddress") or emails.get(clean(t.get("surname")).lower())}
+                                      for t in staff if t.get("surname")]})
+        return sorted(rows, key=lambda r: r["subject"])
+
+    def render(kid, rows):
+        for r in rows:
+            people = "; ".join(t["name"] + (f" <{t['email']}>" if t["email"] else "")
+                               for t in r["teachers"])
+            print(f"  {r['subject'][:30]:<30} {people}")
+    per_kid(args, fetch, render)
+
+
+def cmd_homework(args):
+    status = {"all": None, "outstanding": 0, "submitted": 1, "completed": 2}[args.status]
+
+    def fetch(kid):
+        f = f"SchoolId eq '{kid['schoolId']}'"
+        if status is not None:
+            f += f" and SubmissionStatus eq '{status}'"
+        q = urllib.parse.urlencode({"$filter": f, "page": 1, "pageSize": args.limit,
+                                    "$orderby": "DueDate desc"})
+        return api(f"portal/homework?{q}").get("homework", [])
+
+    def render(kid, items):
+        if not items:
+            print("  No homework on the portal." if args.status == "all"
+                  else f"  No {args.status} homework.")
+        for h in items:
+            due = (h.get("dueDate") or h.get("DueDate") or "")[:10]
+            title = clean(h.get("title") or h.get("name") or h.get("description"))
+            subject = clean(h.get("subjectName") or h.get("subject") or "")
+            print(f"  due {due}  {subject:<18} {title}")
+    per_kid(args, fetch, render)
+
+
+def cmd_reports(args):
+    def fetch(kid):
+        sid = kid["schoolId"]
+        return {"reports": api(f"portals/students/{sid}/schoolreports/reports?$orderby=PublishedOn desc").get("reports", []),
+                "assessments": api(f"portals/students/{sid}/schoolreports/assessments?$orderby=PublishedOn desc").get("assessments", [])}
+
+    def render(kid, d):
+        if not d["reports"] and not d["assessments"]:
+            print("  No published reports or assessments yet.")
+        for kind in ("reports", "assessments"):
+            for r in d[kind]:
+                print(f"  {kind[:-1]:<10} {(r.get('publishedOn') or '')[:10]}  "
+                      f"{clean(r.get('name') or r.get('title'))}  id {r.get('id')}")
+    per_kid(args, fetch, render)
+
+
+def cmd_docs(args):
+    if args.search:
+        q = urllib.parse.quote(args.search)
+        data = api(f"portals/documents/search?searchTerm={q}").get("documents", [])
+    elif args.folder is not None:
+        data = api(f"portals/documents/folders/{args.folder}/documents").get("documents", [])
+    else:
+        data = api("portals/documents/latest").get("documents", [])
+
+    def render(docs):
+        if not docs:
+            print("No documents.")
+        for d in docs:
+            size = int(d.get("fileSize") or 0) // 1024
+            meta = d.get("fileType") + (f", {size} KB" if size else "")
+            print(f"{d.get('documentId'):>7}  {(d.get('submitDateTime') or '')[:10]}  "
+                  f"{clean(d.get('displayName'))}  ({meta})")
+    out(args, data, render)
+
+
+def cmd_folders(args):
+    folders = api("portals/documents/folders/-1").get("folders", [])
+
+    def render(data):
+        children = {}
+        for f in data:
+            children.setdefault(f.get("parentFolderId"), []).append(f)
+        ids = {f["folderId"] for f in data}
+
+        def walk(parent, depth):
+            for f in sorted(children.get(parent, []), key=lambda f: (f.get("order") or 0, f["folderName"])):
+                print(f"{'  ' * depth}{clean(f['folderName'])}  [{f['folderId']}]")
+                walk(f["folderId"], depth + 1)
+        for root in sorted({f.get("parentFolderId") for f in data} - ids, key=lambda x: x or 0):
+            walk(root, 0)
+    out(args, folders, render)
+
+
+def cmd_download(args):
+    body, headers = api(f"portals/documents/{args.id}/commands/download", raw=True)
+    m = re.search(r'filename="?([^";]+)"?', headers.get("Content-Disposition") or "")
+    name = os.path.basename(m.group(1)) if m else f"document-{args.id}"
+    name = re.sub(r"[\x00-\x1f/\\]", "_", name)
+    path = os.path.join(os.path.expanduser(args.dir), name)
+    with open(path, "wb") as f:
+        f.write(body)
+    print(path)
+
+
+def cmd_invoices(args):
+    def render(d):
+        if not d:
+            print("No invoices on the portal.")
+        for i in d:
+            print(json.dumps(i, ensure_ascii=False))
+    out(args, api("portals/invoices").get("invoices", []), render)
+
+
+def cmd_forms(args):
+    data = {"pending": api("portals/electronicforms/pending").get("electronicForms", []),
+            "available": api("portals/electronicforms").get("availableElectronicForms", []),
+            "submitted": api("portals/electronicforms/history").get("electronicForms", [])}
+
+    def render(d):
+        print(f"Pending ({len(d['pending'])})")
+        for f in d["pending"]:
+            print(f"  {f.get('id'):>5}  {clean(f.get('name'))}")
+        print(f"Available ({len(d['available'])})")
+        for f in d["available"]:
+            desc = f"  - {clean(f['description'])}" if clean(f.get("description")) else ""
+            print(f"  {f.get('id'):>5}  {clean(f.get('name'))}{desc}")
+        print(f"Submitted ({len(d['submitted'])})")
+        for f in d["submitted"]:
+            print(f"  {f.get('id'):>5}  {(f.get('submittedOn') or '')[:10]}  {clean(f.get('name'))}")
+    out(args, data, render)
+
+
+def cmd_raw(args):
+    json.dump(api(args.path), sys.stdout, indent=2, ensure_ascii=False)
+    print()
+
+
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="raw JSON output")
+    kid = argparse.ArgumentParser(add_help=False)
+    kid.add_argument("child", nargs="?", help="a child's name or form (default: all)")
+
+    p = argparse.ArgumentParser(prog="isams", parents=[common],
+                                description="iSAMS parent portal from the terminal")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("login", help="sign in and remember the session", parents=[common])
+    s.add_argument("--school", help="the SCHOOL in SCHOOL.parents.isams.cloud")
+    s.set_defaults(fn=cmd_login)
+    sub.add_parser("logout", help="delete the saved session", parents=[common]).set_defaults(fn=cmd_logout)
+    sub.add_parser("whoami", help="who is signed in, and the children", parents=[common]).set_defaults(fn=cmd_whoami)
+    sub.add_parser("kids", help="your children on file", parents=[common]).set_defaults(fn=cmd_kids)
+
+    s = sub.add_parser("timetable", help="lessons for a day (default today) or the week",
+                       parents=[common, kid])
+    s.add_argument("-d", "--day", help="today, tomorrow, a weekday or YYYY-MM-DD")
+    s.add_argument("-w", "--week", action="store_true", help="the whole week")
+    s.add_argument("--all-weeks", action="store_true", help="every rota week (A/B), not just the current one")
+    s.set_defaults(fn=cmd_timetable)
+
+    s = sub.add_parser("calendar", help="the school calendar", parents=[common])
+    s.add_argument("--from", dest="start", help="start date (default today)")
+    s.add_argument("--days", type=int, default=14, help="how far ahead (default 14)")
+    s.add_argument("-s", "--search", help="only events matching this text")
+    s.set_defaults(fn=cmd_calendar)
+
+    s = sub.add_parser("attendance", help="this term's absences and lates", parents=[common, kid])
+    s.set_defaults(fn=cmd_attendance)
+
+    s = sub.add_parser("teachers", help="subjects and who teaches them", parents=[common, kid])
+    s.set_defaults(fn=cmd_teachers)
+
+    s = sub.add_parser("homework", help="homework set on the portal", parents=[common, kid])
+    s.add_argument("--status", choices=["outstanding", "submitted", "completed", "all"], default="all")
+    s.add_argument("-n", "--limit", type=int, default=20)
+    s.set_defaults(fn=cmd_homework)
+
+    s = sub.add_parser("reports", help="published reports and assessments", parents=[common, kid])
+    s.set_defaults(fn=cmd_reports)
+
+    s = sub.add_parser("docs", help="latest documents, a folder, or a search", parents=[common])
+    s.add_argument("-s", "--search", help="search document names")
+    s.add_argument("-f", "--folder", type=int, help="folder id, from 'isams folders'")
+    s.set_defaults(fn=cmd_docs)
+
+    sub.add_parser("folders", help="the document folder tree", parents=[common]).set_defaults(fn=cmd_folders)
+
+    s = sub.add_parser("download", help="save a document", parents=[common])
+    s.add_argument("id", help="document id, from 'isams docs'")
+    s.add_argument("--dir", default=".", help="where to save it (default here)")
+    s.set_defaults(fn=cmd_download)
+
+    sub.add_parser("invoices", help="invoices on the portal", parents=[common]).set_defaults(fn=cmd_invoices)
+    sub.add_parser("forms", help="electronic forms to fill in", parents=[common]).set_defaults(fn=cmd_forms)
+
+    s = sub.add_parser("raw", help="GET any API path, e.g. portals/schools/terms", parents=[common])
+    s.add_argument("path")
+    s.set_defaults(fn=cmd_raw)
+
+    args = p.parse_args()
+    args.json = getattr(args, "json", False)
+    if not hasattr(args, "child"):
+        args.child = None
+    try:
+        args.fn(args)
+    except ApiError as e:
+        sys.exit(str(e))
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

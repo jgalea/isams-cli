@@ -69,7 +69,9 @@ def write_private(path, text):
     os.makedirs(folder, mode=0o700, exist_ok=True)
     os.chmod(folder, 0o700)
     tmp = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    # Windows has no O_NOFOLLOW.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
@@ -796,7 +798,7 @@ def cmd_download(args):
     body, headers = api(f"portals/documents/{args.id}/commands/download", raw=True)
     m = re.search(r'filename="?([^";]+)"?', headers.get("Content-Disposition") or "")
     name = os.path.basename(m.group(1)) if m else f"document-{args.id}"
-    name = re.sub(r"[\x00-\x1f/\\]", "_", name)
+    name = re.sub(r'[\x00-\x1f/\\<>:"|?*]', "_", name)
     path = os.path.join(os.path.expanduser(args.dir), name)
     with open(path, "wb") as f:
         f.write(body)
@@ -903,6 +905,10 @@ def main():
     s = sub.add_parser("raw", help="GET any API path, e.g. portals/schools/terms", parents=[common])
     s.add_argument("path")
     s.set_defaults(fn=cmd_raw)
+
+    # A Windows console or pipe may not be UTF-8; print what it can rather than crash.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="replace")
 
     args = p.parse_args()
     args.json = getattr(args, "json", False)

@@ -12,9 +12,11 @@
 
 It signs in the way the portal does and calls the same JSON API the portal's web app uses. It's read-only and unofficial, not made by or connected to iSAMS.
 
-Needs Python 3.9+ and nothing else. macOS already has it.
+Needs Python 3.9+ and nothing else. Runs on macOS, Linux and Windows.
 
 ## Setup
+
+On a Mac or Linux:
 
 ```
 mkdir -p ~/.local/bin
@@ -24,6 +26,23 @@ isams login
 ```
 
 If `isams` isn't found afterwards, add `~/.local/bin` to your PATH: `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc` and open a new terminal.
+
+On Windows, open PowerShell and install Python first if you don't have it:
+
+```
+winget install Python.Python.3.12
+```
+
+Then open a new PowerShell window and paste:
+
+```
+mkdir "$HOME\bin" -Force
+curl.exe -fsSL https://raw.githubusercontent.com/jgalea/isams-cli/main/isams -o "$HOME\bin\isams.py"
+Set-Content "$HOME\bin\isams.cmd" '@py "%USERPROFILE%\bin\isams.py" %*'
+[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$HOME\bin", "User")
+```
+
+Open one more new PowerShell window so it picks up the PATH change, then run `isams login`. The Windows steps haven't been tested on a real Windows machine yet; if something breaks, open an issue.
 
 `login` asks for the school (the `SCHOOL` in `SCHOOL.parents.isams.cloud`) and your portal username and password. The password goes only to the school's iSAMS sign-in page. What's saved, in `~/.config/isams/` (mode 600), is the refresh token and the sign-in cookies, so you aren't asked again until the school ends the session.
 

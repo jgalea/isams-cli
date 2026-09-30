@@ -546,6 +546,176 @@ def cmd_activities(args):
                     print(f"  {'':<12}{mark}{date.fromisoformat(x['date']):%a %d %b}  {x['time']}")
 
 
+# ---- SchoolCloud (parent-teacher conferences) -----------------------------
+# The portal's "Parent Meeting Bookings" link goes to SchoolCloud, which also
+# signs parents in through iSAMS, so the saved cookies get us in.
+
+def schoolcloud_host():
+    env = os.environ.get("ISAMS_SCHOOLCLOUD")
+    if env:
+        return env
+    sess = session()
+    if not sess.get("schoolcloud"):
+        req = urllib.request.Request(
+            f"https://{sess['school']}.parents.isams.cloud/api/layout?guest=false",
+            headers={"Authorization": f"Bearer {sess['access_token']}", "User-Agent": UA})
+        with OPENER.open(req, timeout=45) as r:
+            m = re.search(r"https://([a-z0-9-]+)\.schoolcloud\.co\.uk", r.read().decode("utf8", "replace"))
+        if not m:
+            sys.exit("This school's portal has no SchoolCloud link, so there are no conferences to book. "
+                     "If it does use SchoolCloud, set ISAMS_SCHOOLCLOUD to its name (NAME.schoolcloud.co.uk).")
+        sess["schoolcloud"] = m.group(1)
+        save(sess)
+    return sess["schoolcloud"]
+
+
+class SchoolCloud:
+    def __init__(self):
+        self.name = schoolcloud_host()
+        self.base = f"https://{self.name}.schoolcloud.co.uk"
+        self.jar = cookie_jar()
+        self.browser = socs_browser(self.jar)
+        self.parent_id = None
+
+    def sign_in(self):
+        r = self.browser.open(f"https://auth.parentseveningsystem.co.uk/{self.name}/parent?"
+                              + urllib.parse.urlencode({"returnUrl": f"{self.base}/Auth/SSO"}), timeout=45)
+        page = r.read().decode("utf8", "replace")
+        if 'id="login-form"' in page:
+            r = submit_login(self.browser, page, r.url)
+            page = r.read().decode("utf8", "replace")
+        # The identity server hands back a self-submitting form to SchoolCloud.
+        for _ in range(3):
+            form = re.search(r"<form[^>]*action=['\"]([^'\"]+)['\"]", page)
+            if "/Parent/" in r.url or not form:
+                break
+            fields = re.findall(r"<input[^>]*name=['\"]([^'\"]+)['\"][^>]*value=['\"]([^'\"]*)['\"]", page)
+            body = urllib.parse.urlencode({k: html.unescape(v) for k, v in fields}).encode()
+            r = self.browser.open(urllib.parse.urljoin(r.url, html.unescape(form.group(1))), body, timeout=45)
+            page = r.read().decode("utf8", "replace")
+        if "/Parent/" not in r.url:
+            sys.exit("Could not sign in to SchoolCloud. Try 'isams login' and run this again.")
+        save_jar(self.jar)
+        m = re.search(r'window\.user = \{"Id":(\d+)', page)
+        if not m:
+            sys.exit("SchoolCloud signed in but its page has changed shape; this tool needs updating.")
+        self.parent_id = int(m.group(1))
+
+    def call(self, path, body=None, retry=True):
+        if self.parent_id is None:
+            self.sign_in()
+        req = urllib.request.Request(
+            self.base + path, json.dumps(body).encode() if body is not None else None,
+            headers={"Accept": "application/json", "Content-Type": "application/json",
+                     "X-Requested-With": "XMLHttpRequest"})
+        try:
+            with self.browser.open(req, timeout=45) as r:
+                data = r.read()
+                return json.loads(data) if data else {}
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and retry:
+                self.sign_in()
+                return self.call(path, body, retry=False)
+            raise ApiError(e.code, e.read().decode("utf8", "replace"))
+
+
+def local_time(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+
+
+def conference_data(sc, child):
+    evening = sc.call("/api/evening/current")
+    if not evening or not evening.get("id"):
+        return None
+    students = [ps["student"] for ps in sc.call(f"/api/parents/{sc.parent_id}").get("parentStudents", [])]
+    if child:
+        n = child.lower()
+        students = [s for s in students if n in s["name"].lower() or n == (s.get("regClass") or "").lower()]
+        if not students:
+            sys.exit(f"No child matches '{child}' in SchoolCloud.")
+    booked = sc.call(f"/api/evenings/{evening['id']}/appointments?parentID={sc.parent_id}") or []
+    kids_out = []
+    for s in students:
+        teachers = []
+        for td in sc.call(f"/api/evenings/{evening['id']}/teacherDepartments?"
+                          f"studentId={s['id']}&parentId={sc.parent_id}"):
+            column = (f"studentAndClasses={s['id']}:{td['classExternalId']}" if td.get("isGroupAppointment")
+                      else f"studentAndTeacherDepartments={s['id']}:{td['teacherDepartmentId']}")
+            avail = sc.call(f"/api/appointments/make/{evening['id']}?parentId={sc.parent_id}&{column}")
+            col = (avail.get("data") or [{}])[0]
+            teachers.append({
+                "teacher": clean(td["teacher"]["name"]), "subject": clean(td["department"]["name"]),
+                "column": col,
+                "free": [x for x in col.get("slots", []) if not x.get("unavailableReason")
+                         and x.get("isParentAvailable", True) and x.get("isTeacherAvailable", True)]})
+        kids_out.append({"student": s, "teachers": teachers,
+                         "booked": [a for a in booked if a.get("studentId") == s["id"]]})
+    # A parent can't be in two meetings at once, whatever SchoolCloud offers.
+    for k in kids_out:
+        for t in k["teachers"]:
+            t["free"] = [x for x in t["free"] if not any(
+                x["startsAt"] < a["endsAt"] and a["startsAt"] < x["endsAt"] for a in booked)]
+    return {"evening": evening, "kids": kids_out}
+
+
+def book_slot(sc, data, when, teacher):
+    if len(data["kids"]) != 1:
+        sys.exit("Name one child to book for, e.g. 'isams conferences leo --book 10:20'.")
+    kid = data["kids"][0]
+    options = [t for t in kid["teachers"] if not teacher or teacher.lower() in
+               (t["teacher"] + " " + t["subject"]).lower()]
+    if len(options) != 1:
+        sys.exit("Say which teacher with --teacher. Options: "
+                 + "; ".join(f"{t['teacher']} ({t['subject']})" for t in kid["teachers"]))
+    t = options[0]
+    slot = next((x for x in t["free"] if local_time(x["startsAt"]).strftime("%H:%M") == when), None)
+    if not slot:
+        sys.exit(f"{when} is not free with {t['teacher']}. Free: "
+                 + ", ".join(local_time(x["startsAt"]).strftime("%H:%M") for x in t["free"]))
+    col = t["column"]
+    made = sc.call("/api/appointments", {
+        "classExternalId": col.get("classExternalId"), "groupingId": col.get("groupingId"),
+        "departmentId": col["department"]["id"], "eveningId": slot["eveningId"],
+        "parentId": sc.parent_id, "studentId": kid["student"]["id"], "teacherId": col["teacher"]["id"],
+        "startsAt": slot["startsAt"], "endsAt": slot["endsAt"],
+        "isVideoCall": data["evening"].get("eveningType") == "VideoCall"})
+    # Read it back rather than trusting the response.
+    mine = sc.call(f"/api/evenings/{data['evening']['id']}/appointments?parentID={sc.parent_id}") or []
+    if not any(a.get("id") == made.get("id") for a in mine):
+        sys.exit("SchoolCloud accepted the booking but it is not in your appointments; check the portal.")
+    print(f"Booked {kid['student']['firstname']} with {t['teacher']} at "
+          f"{local_time(slot['startsAt']):%a %d %b %H:%M} (appointment {made['id']}).")
+
+
+def cmd_conferences(args):
+    sc = SchoolCloud()
+    data = conference_data(sc, args.child)
+    if not data:
+        print("No parent-teacher conference is open for booking.")
+        return
+    if args.book:
+        book_slot(sc, data, args.book, args.teacher)
+        return
+    if args.json:
+        out(args, data, None)
+        return
+    ev = data["evening"]
+    kind = " (video call)" if ev.get("eveningType") == "VideoCall" else ""
+    print(f"{clean(ev['title'])}{kind}")
+    print(f"{local_time(ev['startsAt']):%a %d %b %Y, %H:%M}-{local_time(ev['endsAt']):%H:%M}; "
+          f"bookings close {local_time(ev['closesAt']):%a %d %b %H:%M}")
+    for k in data["kids"]:
+        s = k["student"]
+        print(f"\n== {s['firstname'].split(' ')[0]} ({s.get('regClass')}) ==")
+        for a in sorted(k["booked"], key=lambda a: a["startsAt"]):
+            who = ", ".join(clean(g["name"]) for g in a.get("groupTeachers") or []) or clean(a.get("teacher", {}).get("name"))
+            print(f"  booked  {local_time(a['startsAt']):%H:%M}  {who}")
+        for t in k["teachers"]:
+            times = " ".join(local_time(x["startsAt"]).strftime("%H:%M") for x in t["free"])
+            print(f"  {t['teacher']} ({t['subject']})")
+            print(f"    free: {times or 'none'}")
+
+
 # ---- commands --------------------------------------------------------------
 
 def cmd_login(args):
@@ -898,6 +1068,12 @@ def main():
     s = sub.add_parser("activities", help="after-school clubs, from SOCS", parents=[common, kid])
     s.add_argument("--sessions", action="store_true", help="list every session date")
     s.set_defaults(fn=cmd_activities)
+
+    s = sub.add_parser("conferences", help="parent-teacher conference slots and bookings, from SchoolCloud",
+                       parents=[common, kid])
+    s.add_argument("--book", metavar="HH:MM", help="book this start time for the named child")
+    s.add_argument("--teacher", help="which teacher to book with, if the child has several")
+    s.set_defaults(fn=cmd_conferences)
 
     sub.add_parser("invoices", help="invoices on the portal", parents=[common]).set_defaults(fn=cmd_invoices)
     sub.add_parser("forms", help="electronic forms to fill in", parents=[common]).set_defaults(fn=cmd_forms)

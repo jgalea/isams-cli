@@ -55,6 +55,8 @@ isams whoami                      who's signed in, and the children
 isams timetable [child]           today's lessons (-d tomorrow|fri|YYYY-MM-DD, -w for the week)
 isams calendar                    school calendar, next 14 days (--days, --from, -s text)
 isams activities [child]          after-school clubs from SOCS: day, staff, next session (--sessions for every date)
+isams conferences [child]         parent-teacher conference slots and your bookings, from SchoolCloud
+isams conferences CHILD --book HH:MM [--teacher NAME]   book a slot
 isams attendance [child]          this term's absences and lates
 isams teachers [child]            subjects, teachers and their emails
 isams homework [child]            homework (--status outstanding|submitted|completed)
@@ -72,3 +74,5 @@ isams raw <path>                  GET any API path, e.g. portals/schools/terms
 Which sections return data depends on what your school has switched on in the portal.
 
 `activities` works for schools that run clubs in SOCS and link it from the iSAMS parent portal. SOCS signs you in through the same iSAMS account, so there's no second login. The SOCS school number is read from the portal; set `ISAMS_SOCS_ID` if it can't be found. SOCS doesn't hold club descriptions, only names, staff and dates.
+
+`conferences` works for schools that book parent-teacher meetings in SchoolCloud and link it from the portal ("Parent Meeting Bookings"). It signs in with the same iSAMS account, shows each teacher's free slots in your local time, leaves out times that clash with meetings you've already booked, and after `--book` reads your appointments back to confirm the booking is there. Set `ISAMS_SCHOOLCLOUD` if the SchoolCloud name can't be found in the portal.
